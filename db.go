@@ -156,7 +156,8 @@ func (db *DB) compactPage(page *Page) {
 	}
 }
 
-func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, flags uint16) error {
+// Update the signature to accept ttl time.Duration and trailing flags uint16
+func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, ttl time.Duration, flags uint16) error {
 	page, err := db.bp.FetchPage(pageID)
 	if err != nil {
 		return err
@@ -170,23 +171,17 @@ func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, flags
 	const SlottedHeaderSize = 16
 	const PageSizeLimit = 32768
 
-	// 1. Self-Healing Formatter Guard:
-	// If the page is completely fresh or has garbage/out-of-bounds header markers,
-	// initialize it as a clean, compliant slotted data page.
+	// 1. Self-Healing Formatter Guard
 	numSlots := binary.LittleEndian.Uint16(page.Data[0:2])
 	freeSpaceLower := binary.LittleEndian.Uint16(page.Data[2:4])
 	freeSpaceUpper := binary.LittleEndian.Uint16(page.Data[4:6])
 
 	if freeSpaceUpper == 0 || freeSpaceUpper > PageSizeLimit || freeSpaceLower > freeSpaceUpper {
-		// Zero out the block data frame cleanly
 		for i := 0; i < PageSizeLimit; i++ {
 			page.Data[i] = 0
 		}
-		// Initialize structural layout points: 0 active slots
 		binary.LittleEndian.PutUint16(page.Data[0:2], 0)
-		// Lower pointer tracks slot arrays starting right after the page header
 		binary.LittleEndian.PutUint16(page.Data[2:4], SlottedHeaderSize)
-		// Upper pointer tracks record data growing backwards from the end of the page block
 		binary.LittleEndian.PutUint16(page.Data[4:6], PageSizeLimit)
 		
 		numSlots = 0
@@ -194,35 +189,34 @@ func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, flags
 		freeSpaceUpper = PageSizeLimit
 	}
 
-	// 2. Defensive Bounds Verification:
-	// Check that required payload bytes don't overwrite or overshoot boundaries
+	// 2. Defensive Bounds Verification
 	requiredBytes := 4 + uint16(len(key)) + uint16(len(value))
 	if freeSpaceLower+requiredBytes+2 > freeSpaceUpper {
 		return fmt.Errorf("slotted page %d is full, space allocation rejected", pageID)
 	}
 
-	// Calculate target storage record offset point safely
 	targetOffset := freeSpaceUpper - requiredBytes
 	if targetOffset < freeSpaceLower || targetOffset > PageSizeLimit {
 		return fmt.Errorf("critical engine tracking failure: calculated offset %d out of bounds", targetOffset)
 	}
 
-	// 3. Write Data Securely inside the Sanitized Boundary
-	// Write slot array lookup item entry
+	// 3. Write Data Securely
 	slotIndexOffset := freeSpaceLower
 	binary.LittleEndian.PutUint16(page.Data[slotIndexOffset:slotIndexOffset+2], targetOffset)
 
-	// Write record layout at the calculated backwards offset safely
 	binary.LittleEndian.PutUint16(page.Data[targetOffset:targetOffset+2], uint16(len(key)))
 	binary.LittleEndian.PutUint16(page.Data[targetOffset+2:targetOffset+4], uint16(len(value)))
 	
 	copy(page.Data[targetOffset+4:targetOffset+4+uint16(len(key))], key)
 	copy(page.Data[targetOffset+4+uint16(len(key)):targetOffset+requiredBytes], value)
 
-	// Update page allocation header pointers
+	// Update page allocation headers
 	binary.LittleEndian.PutUint16(page.Data[0:2], numSlots+1)
 	binary.LittleEndian.PutUint16(page.Data[2:4], freeSpaceLower+2)
 	binary.LittleEndian.PutUint16(page.Data[4:6], targetOffset)
+
+	// Note: If your engine utilizes the ttl parameter for block eviction strategies later,
+	// you can map it here. For now, it safely satisfies the caller contracts.
 
 	return nil
 }
