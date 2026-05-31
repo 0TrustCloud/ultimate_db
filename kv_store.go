@@ -70,18 +70,30 @@ func (s *BTreeKVStore) Get(txn TxnHandle, key []byte) ([]byte, error) {
 		s.tree.bp.UnpinPage(node.ID, false)
 	}()
 
+	pageSize := uint32(len(node.Data))
 	numCells := node.NumCells()
 	var offset uint32 = BTreeHeaderSize
+
 	for i := uint16(0); i < numCells; i++ {
-		kLen := binary.LittleEndian.Uint16(node.Data[offset : offset+2])
-		vLen := binary.LittleEndian.Uint16(node.Data[offset+2 : offset+4])
-		cellKey := node.Data[offset+4 : offset+4+uint32(kLen)]
+		// Hardened Guard: Stop scanning immediately if cell headers overflow the data allocation length
+		if offset+4 > pageSize {
+			break
+		}
+		kLen := uint32(binary.LittleEndian.Uint16(node.Data[offset : offset+2]))
+		vLen := uint32(binary.LittleEndian.Uint16(node.Data[offset+2 : offset+4]))
+		
+		// Hardened Guard: Prevent out-of-bounds slicing across corrupt cell sizes
+		if offset+4+kLen+vLen > pageSize {
+			break
+		}
+
+		cellKey := node.Data[offset+4 : offset+4+kLen]
 		if bytes.Equal(key, cellKey) {
 			val := make([]byte, vLen)
-			copy(val, node.Data[offset+4+uint32(kLen) : offset+4+uint32(kLen)+uint32(vLen)])
+			copy(val, node.Data[offset+4+kLen : offset+4+kLen+vLen])
 			return val, nil
 		}
-		offset += 4 + uint32(kLen) + uint32(vLen)
+		offset += 4 + kLen + vLen
 	}
 	return nil, fmt.Errorf("key not found")
 }
@@ -105,30 +117,50 @@ func (s *BTreeKVStore) Delete(txn TxnHandle, key []byte) error {
 		// Version shifted during latch upgrading; proceed with validation scan
 	}
 
+	pageSize := uint32(len(node.Data))
 	numCells := node.NumCells()
 	var offset uint32 = BTreeHeaderSize
-	for i := uint16(0); i < numCells; i++ {
-		kLen := binary.LittleEndian.Uint16(node.Data[offset : offset+2])
-		vLen := binary.LittleEndian.Uint16(node.Data[offset+2 : offset+4])
-		cellKey := node.Data[offset+4 : offset+4+uint32(kLen)]
-		cellBytes := 4 + uint32(kLen) + uint32(vLen)
 
+	for i := uint16(0); i < numCells; i++ {
+		// Hardened Guard: Ensure room exists to safely process cell length indicators
+		if offset+4 > pageSize {
+			break
+		}
+		kLen := uint32(binary.LittleEndian.Uint16(node.Data[offset : offset+2]))
+		vLen := uint32(binary.LittleEndian.Uint16(node.Data[offset+2 : offset+4]))
+		cellBytes := 4 + kLen + vLen
+
+		// Hardened Guard: Stop loop processing if total length maps outside physical slice ranges
+		if offset+cellBytes > pageSize {
+			break
+		}
+
+		cellKey := node.Data[offset+4 : offset+4+kLen]
 		if bytes.Equal(key, cellKey) {
 			var tempOffset uint32 = BTreeHeaderSize
 			for j := uint16(0); j < numCells; j++ {
-				kl := binary.LittleEndian.Uint16(node.Data[tempOffset : tempOffset+2])
-				vl := binary.LittleEndian.Uint16(node.Data[tempOffset+2 : tempOffset+4])
-				tempOffset += 4 + uint32(kl) + uint32(vl)
+				if tempOffset+4 > pageSize {
+					break
+				}
+				kl := uint32(binary.LittleEndian.Uint16(node.Data[tempOffset : tempOffset+2]))
+				vl := uint32(binary.LittleEndian.Uint16(node.Data[tempOffset+2 : tempOffset+4]))
+				if tempOffset+4+kl+vl > pageSize {
+					break
+				}
+				tempOffset += 4 + kl + vl
 			}
 			totalSize := tempOffset
 
-			// Sliding compaction deletion
-			copy(node.Data[offset:totalSize-cellBytes], node.Data[offset+cellBytes:totalSize])
-			for idx := totalSize - cellBytes; idx < totalSize; idx++ {
-				node.Data[idx] = 0
+			// Hardened Slide Boundaries Check
+			if offset+cellBytes <= totalSize && totalSize <= pageSize {
+				// Sliding compaction deletion
+				copy(node.Data[offset:totalSize-cellBytes], node.Data[offset+cellBytes:totalSize])
+				for idx := totalSize - cellBytes; idx < totalSize; idx++ {
+					node.Data[idx] = 0
+				}
+				node.SetNumCells(numCells - 1)
+				node.MemVersion++
 			}
-			node.SetNumCells(numCells - 1)
-			node.MemVersion++
 			return nil
 		}
 		offset += cellBytes
