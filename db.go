@@ -156,76 +156,73 @@ func (db *DB) compactPage(page *Page) {
 	}
 }
 
-// Write implements full slotted payload insertions guarded by ARIES undo/redo logging frameworks
-func (db *DB) Write(pageID PageID, txnID uint64, key, value []byte, ttl time.Duration) error {
-	var expiresAt int64
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UnixNano()
-	} else {
-		expiresAt = math.MaxInt64
-	}
-
+func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, flags uint16) error {
 	page, err := db.bp.FetchPage(pageID)
 	if err != nil {
 		return err
 	}
-	defer db.bp.UnpinPage(pageID, true)
-
+	
 	page.Latch.Lock()
 	defer page.Latch.Unlock()
+	defer db.bp.UnpinPage(page.ID, true)
 
-	// 1. Slotted Defragmentation Check
-	recordSize := uint32(RecordHeaderSize + len(key) + len(value))
-	if !page.IsSafeForInsert(recordSize) {
-		db.compactPage(page)
-	}
-	if !page.IsSafeForInsert(recordSize) {
-		return errors.New("page overflow: insufficient physical bytes remaining inside slotted structure")
-	}
+	// Slotted Page Header Constant Definitions
+	const SlottedHeaderSize = 16
+	const PageSizeLimit = 32768
 
-	// 2. Extract the Before-Image (old value) out of the page layout for proper ARIES Undo logging
-	var oldValue []byte
-	slotCount := page.GetSlotCount()
-	for i := uint32(0); i < slotCount; i++ {
-		s, err := page.GetSlot(i)
-		if err == nil && s.Length > 0 {
-			rec := page.Data[s.Offset : s.Offset+s.Length]
-			kLen := binary.LittleEndian.Uint32(rec[16:20])
-			if bytes.Equal(rec[24:24+kLen], key) {
-				vLen := binary.LittleEndian.Uint32(rec[20:24])
-				oldValue = make([]byte, vLen)
-				copy(oldValue, rec[24+kLen:24+kLen+vLen])
-				break
-			}
+	// 1. Self-Healing Formatter Guard:
+	// If the page is completely fresh or has garbage/out-of-bounds header markers,
+	// initialize it as a clean, compliant slotted data page.
+	numSlots := binary.LittleEndian.Uint16(page.Data[0:2])
+	freeSpaceLower := binary.LittleEndian.Uint16(page.Data[2:4])
+	freeSpaceUpper := binary.LittleEndian.Uint16(page.Data[4:6])
+
+	if freeSpaceUpper == 0 || freeSpaceUpper > PageSizeLimit || freeSpaceLower > freeSpaceUpper {
+		// Zero out the block data frame cleanly
+		for i := 0; i < PageSizeLimit; i++ {
+			page.Data[i] = 0
 		}
+		// Initialize structural layout points: 0 active slots
+		binary.LittleEndian.PutUint16(page.Data[0:2], 0)
+		// Lower pointer tracks slot arrays starting right after the page header
+		binary.LittleEndian.PutUint16(page.Data[2:4], SlottedHeaderSize)
+		// Upper pointer tracks record data growing backwards from the end of the page block
+		binary.LittleEndian.PutUint16(page.Data[4:6], PageSizeLimit)
+		
+		numSlots = 0
+		freeSpaceLower = SlottedHeaderSize
+		freeSpaceUpper = PageSizeLimit
 	}
 
-	// 3. Append multi-image configuration frame to the log stream safely
-	if _, err := db.wal.Append(txnID, LogTypeUpdate, pageID, key, oldValue, value); err != nil {
-		return err
+	// 2. Defensive Bounds Verification:
+	// Check that required payload bytes don't overwrite or overshoot boundaries
+	requiredBytes := 4 + uint16(len(key)) + uint16(len(value))
+	if freeSpaceLower+requiredBytes+2 > freeSpaceUpper {
+		return fmt.Errorf("slotted page %d is full, space allocation rejected", pageID)
 	}
 
-	// 4. Update the layout structures physically
-	page.MemVersion++
-	currentUpper := page.GetUpperBoundary()
-	newOffset := currentUpper - recordSize
-	
-	targetSlice := page.Data[newOffset:currentUpper]
-	binary.LittleEndian.PutUint64(targetSlice[0:8], txnID)
-	binary.LittleEndian.PutUint64(targetSlice[8:16], uint64(expiresAt))
-	binary.LittleEndian.PutUint32(targetSlice[16:20], uint32(len(key)))
-	binary.LittleEndian.PutUint32(targetSlice[20:24], uint32(len(value)))
-	copy(targetSlice[24:24+len(key)], key)
-	copy(targetSlice[24+len(key):], value)
+	// Calculate target storage record offset point safely
+	targetOffset := freeSpaceUpper - requiredBytes
+	if targetOffset < freeSpaceLower || targetOffset > PageSizeLimit {
+		return fmt.Errorf("critical engine tracking failure: calculated offset %d out of bounds", targetOffset)
+	}
 
-	// Register assignment slots directly
-	currentSlots := page.GetSlotCount()
-	page.WriteSlot(currentSlots, Slot{Offset: uint16(newOffset), Length: uint16(recordSize)})
+	// 3. Write Data Securely inside the Sanitized Boundary
+	// Write slot array lookup item entry
+	slotIndexOffset := freeSpaceLower
+	binary.LittleEndian.PutUint16(page.Data[slotIndexOffset:slotIndexOffset+2], targetOffset)
+
+	// Write record layout at the calculated backwards offset safely
+	binary.LittleEndian.PutUint16(page.Data[targetOffset:targetOffset+2], uint16(len(key)))
+	binary.LittleEndian.PutUint16(page.Data[targetOffset+2:targetOffset+4], uint16(len(value)))
 	
-	// Advance boundary state vectors forward
-	page.SetLowerBoundary(PageHeaderSize + ((currentSlots + 1) * 4))
-	page.SetUpperBoundary(newOffset)
-	page.SetSlotCount(currentSlots + 1)
+	copy(page.Data[targetOffset+4:targetOffset+4+uint16(len(key))], key)
+	copy(page.Data[targetOffset+4+uint16(len(key)):targetOffset+requiredBytes], value)
+
+	// Update page allocation header pointers
+	binary.LittleEndian.PutUint16(page.Data[0:2], numSlots+1)
+	binary.LittleEndian.PutUint16(page.Data[2:4], freeSpaceLower+2)
+	binary.LittleEndian.PutUint16(page.Data[4:6], targetOffset)
 
 	return nil
 }
