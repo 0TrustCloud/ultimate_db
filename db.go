@@ -180,7 +180,7 @@ func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, mixPa
 	default:
 		flags = 0
 	}
-	fmt.println(flags)
+	fmt.Println(flags)
 
 	const SlottedHeaderSize = 16
 	const PageSizeLimit = 32768
