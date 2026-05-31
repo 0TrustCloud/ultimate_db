@@ -39,13 +39,25 @@ func (p *BTreePage) SetRightmostChildID(id PageID) { binary.LittleEndian.PutUint
 func (p *BTreePage) IsSafeForInsert(requiredBytes uint32) bool {
 	numCells := p.NumCells()
 	var offset uint32 = BTreeHeaderSize
+	
 	for i := uint16(0); i < numCells; i++ {
+		// Prevent reading past the physical 32KB page size boundaries
+		if offset+4 > PageSize {
+			return false
+		}
+		
 		if p.PageType() == PageTypeLeaf {
 			kLen := uint32(binary.LittleEndian.Uint16(p.Data[offset : offset+2]))
 			vLen := uint32(binary.LittleEndian.Uint16(p.Data[offset+2 : offset+4]))
+			if offset+4+kLen+vLen > PageSize {
+				return false
+			}
 			offset += 4 + kLen + vLen
 		} else {
 			kLen := uint32(binary.LittleEndian.Uint16(p.Data[offset : offset+2]))
+			if offset+10+kLen > PageSize {
+				return false
+			}
 			offset += 10 + kLen
 		}
 	}
