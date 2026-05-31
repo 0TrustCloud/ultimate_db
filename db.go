@@ -350,8 +350,8 @@ func (db *DB) ReadCompressed(pageID PageID, readTxnID uint64, key []byte, codec 
 }
 
 func (db *DB) ScanCompressed(pageID PageID, readTxnID uint64, prefix []byte, codec Codec, iter func(key, value []byte) bool) error {
-	decompressingIter := func(key, payload []byte) bool {
-		if len(payload) < 2 || payload[0] != codec.ID() {
+    decompressingIter := func(key, payload []byte) bool {
+        if len(payload) < 2 || payload[0] != codec.ID() {
 			return iter(key, payload)
 		}
 		decompressed, err := codec.Decode(payload[1:])
