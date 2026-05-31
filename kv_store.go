@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+// BTreeRootPageID isolates the key-value backend from the system ORM catalog tables
+const BTreeRootPageID = PageID(1000)
+
 type BTreeKVStore struct {
 	db   *DB
 	tree *BTree
@@ -21,11 +24,35 @@ func (t *btreeTxn) ID() uint64        { return t.id }
 func (t *btreeTxn) Commit() error     { return nil }
 func (t *btreeTxn) Abort() error      { return nil }
 
-// NewBTreeKVStore binds the database buffer pool allocation layer to an active B-Tree layout
+// NewBTreeKVStore binds the database buffer pool allocation layer to an active isolated B-Tree layout
 func NewBTreeKVStore(db *DB) KVStore {
+	// Attempt to pull the isolated root page from cache or disk
+	rawPage, err := db.bp.FetchPage(BTreeRootPageID)
+	if err != nil {
+		// If the page does not exist yet, allocate it directly through the buffer pool
+		rawPage, err = db.bp.NewPage()
+		if err != nil {
+			panic("Critical: Failed to allocate initial BTree root page: " + err.Error())
+		}
+	}
+
+	rawPage.Latch.Lock()
+	node := &BTreePage{rawPage}
+	
+	// Self-healing block type formatter to overwrite raw or unformatted database pages safely
+	if node.PageType() != PageTypeLeaf && node.PageType() != PageTypeInternal {
+		node.BTreeInit()
+		node.SetPageType(PageTypeLeaf)
+		node.SetNumCells(0)
+		node.SetNextLeafID(0)
+		node.SetParentID(0)
+	}
+	rawPage.Latch.Unlock()
+	db.bp.UnpinPage(rawPage.ID, true)
+
 	return &BTreeKVStore{
 		db:   db,
-		tree: NewBTree(db.bp, PageID(1)), // Standardized default root page catalog index
+		tree: NewBTree(db.bp, BTreeRootPageID),
 	}
 }
 
