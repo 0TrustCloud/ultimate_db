@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-        "math"
 	"sync"
 	"sync/atomic"
 	"time"
