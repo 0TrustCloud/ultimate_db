@@ -155,8 +155,7 @@ func (db *DB) compactPage(page *Page) {
 	}
 }
 
-// Write accepts the 5 arguments expected by the v1.3.0 internal package files,
-// handling both uint16 flags and time.Duration inputs gracefully.
+// Write transactionalizes mutations over physical page directories matching explicit MVCC schemas.
 func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, mixParam interface{}) error {
 	page, err := db.bp.FetchPage(pageID)
 	if err != nil {
@@ -167,69 +166,65 @@ func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, mixPa
 	defer page.Latch.Unlock()
 	defer db.bp.UnpinPage(page.ID, true)
 
-	// Extract flags or handle TTL safely if needed
-	var flags uint16
+	// 1. Harmonize Time to Live (TTL) parameters with mixed framework values
+	nowNano := time.Now().UnixNano()
+	var expiresAt uint64 = uint64(nowNano + int64(100*365*24*time.Hour)) // Default far future window
+
 	switch v := mixParam.(type) {
-	case uint16:
-		flags = v
-	case int:
-		flags = uint16(v)
 	case time.Duration:
-		// If it's a duration, we can use it for page policies or downcast flags if required
-		flags = uint16(v) 
-	default:
-		flags = 0
-	}
-	fmt.Println(flags)
-
-	const SlottedHeaderSize = 16
-	const PageSizeLimit = 32768
-
-	// 1. Self-Healing Formatter Guard
-	numSlots := binary.LittleEndian.Uint16(page.Data[0:2])
-	freeSpaceLower := binary.LittleEndian.Uint16(page.Data[2:4])
-	freeSpaceUpper := binary.LittleEndian.Uint16(page.Data[4:6])
-
-	if freeSpaceUpper == 0 || freeSpaceUpper > PageSizeLimit || freeSpaceLower > freeSpaceUpper {
-		for i := 0; i < PageSizeLimit; i++ {
-			page.Data[i] = 0
+		if v > 0 {
+			expiresAt = uint64(time.Now().Add(v).UnixNano())
 		}
-		binary.LittleEndian.PutUint16(page.Data[0:2], 0)
-		binary.LittleEndian.PutUint16(page.Data[2:4], SlottedHeaderSize)
-		binary.LittleEndian.PutUint16(page.Data[4:6], PageSizeLimit)
-		
-		numSlots = 0
-		freeSpaceLower = SlottedHeaderSize
-		freeSpaceUpper = PageSizeLimit
+	case int64:
+		if v > 0 {
+			expiresAt = uint64(time.Now().Add(time.Duration(v)).UnixNano())
+		}
+	case int:
+		if v > 0 {
+			expiresAt = uint64(time.Now().Add(time.Duration(v)).UnixNano())
+		}
 	}
 
-	// 2. Defensive Bounds Verification
-	requiredBytes := 4 + uint16(len(key)) + uint16(len(value))
-	if freeSpaceLower+requiredBytes+2 > freeSpaceUpper {
-		return fmt.Errorf("slotted page %d is full, space allocation rejected", pageID)
+	// 2. Self-Healing Formatter Guard
+	if page.GetUpperBoundary() == 0 || page.GetUpperBoundary() > 32768 {
+		page.Init()
 	}
 
-	targetOffset := freeSpaceUpper - requiredBytes
-	if targetOffset < freeSpaceLower || targetOffset > PageSizeLimit {
-		return fmt.Errorf("critical engine tracking failure: calculated offset %d out of bounds", targetOffset)
+	// 3. Structural Boundary Verification & Compaction Pass Triggers
+	recordSize := uint32(RecordHeaderSize + len(key) + len(value))
+	if !page.IsSafeForInsert(recordSize) {
+		db.compactPage(page)
+	}
+	if !page.IsSafeForInsert(recordSize) {
+		return fmt.Errorf("slotted storage page %d overflowed: frame full after complete compression pass", pageID)
 	}
 
-	// 3. Write Data Securely
-	slotIndexOffset := freeSpaceLower
-	binary.LittleEndian.PutUint16(page.Data[slotIndexOffset:slotIndexOffset+2], targetOffset)
+	// 4. Data Layout Insertion
+	currentUpper := page.GetUpperBoundary()
+	newOffset := currentUpper - recordSize
 
-	binary.LittleEndian.PutUint16(page.Data[targetOffset:targetOffset+2], uint16(len(key)))
-	binary.LittleEndian.PutUint16(page.Data[targetOffset+2:targetOffset+4], uint16(len(value)))
+	if newOffset < page.GetLowerBoundary() || newOffset > 32768 {
+		return fmt.Errorf("critical slotted calculation pointer anomaly: offset %d corrupts data tables", newOffset)
+	}
+
+	targetSlice := page.Data[newOffset:currentUpper]
+	binary.LittleEndian.PutUint64(targetSlice[0:8], txnID)
+	binary.LittleEndian.PutUint64(targetSlice[8:16], expiresAt)
+	binary.LittleEndian.PutUint32(targetSlice[16:20], uint32(len(key)))
+	binary.LittleEndian.PutUint32(targetSlice[20:24], uint32(len(value)))
 	
-	copy(page.Data[targetOffset+4:targetOffset+4+uint16(len(key))], key)
-	if value != nil {
-		copy(page.Data[targetOffset+4+uint16(len(key)):targetOffset+requiredBytes], value)
+	copy(targetSlice[24:24+len(key)], key)
+	if value != nil && len(value) > 0 {
+		copy(targetSlice[24+len(key):], value)
 	}
 
-	// Update page allocation headers
-	binary.LittleEndian.PutUint16(page.Data[0:2], numSlots+1)
-	binary.LittleEndian.PutUint16(page.Data[2:4], freeSpaceLower+2)
-	binary.LittleEndian.PutUint16(page.Data[4:6], targetOffset)
+	// 5. Commit Frame Offsets Natively
+	currentSlots := page.GetSlotCount()
+	page.WriteSlot(currentSlots, Slot{Offset: uint16(newOffset), Length: uint16(recordSize)})
+	
+	page.SetLowerBoundary(PageHeaderSize + ((currentSlots + 1) * 4))
+	page.SetUpperBoundary(newOffset)
+	page.SetSlotCount(currentSlots + 1)
 
 	return nil
 }
@@ -354,8 +349,8 @@ func (db *DB) ReadCompressed(pageID PageID, readTxnID uint64, key []byte, codec 
 }
 
 func (db *DB) ScanCompressed(pageID PageID, readTxnID uint64, prefix []byte, codec Codec, iter func(key, value []byte) bool) error {
-    decompressingIter := func(key, payload []byte) bool {
-        if len(payload) < 2 || payload[0] != codec.ID() {
+	decompressingIter := func(key, payload []byte) bool {
+		if len(payload) < 2 || payload[0] != codec.ID() {
 			return iter(key, payload)
 		}
 		decompressed, err := codec.Decode(payload[1:])
