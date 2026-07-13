@@ -58,9 +58,44 @@ func PerformRecovery(db *DB, walPath string) error {
 			maxTxnID = txnID
 		}
 	}
+	// Also advance past any committed txn ids already on slotted pages so
+	// post-restart writes are not shadowed by higher historical txn numbers.
+	if pageMax := db.maxTxnIDOnPages(); pageMax > maxTxnID {
+		maxTxnID = pageMax
+	}
 	db.nextTxnID.Store(maxTxnID)
 
 	return nil
+}
+
+// maxTxnIDOnPages scans loaded slotted pages for the highest record txn id.
+func (db *DB) maxTxnIDOnPages() uint64 {
+	if db == nil || db.bp == nil {
+		return 0
+	}
+	var max uint64
+	// Site/auth/message pages used by products commonly sit in low page ids.
+	for pageID := PageID(1); pageID <= 32; pageID++ {
+		page, err := db.bp.FetchPage(pageID)
+		if err != nil {
+			continue
+		}
+		page.Latch.RLock()
+		slots := page.GetSlotCount()
+		for i := uint32(0); i < slots; i++ {
+			slot, err := page.GetSlot(i)
+			if err != nil || slot.Length < 8 {
+				continue
+			}
+			recordTxnID := binary.LittleEndian.Uint64(page.Data[slot.Offset : slot.Offset+8])
+			if recordTxnID > max {
+				max = recordTxnID
+			}
+		}
+		page.Latch.RUnlock()
+		db.bp.UnpinPage(pageID, false)
+	}
+	return max
 }
 
 // ============================================================================

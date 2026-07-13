@@ -571,47 +571,105 @@ func (tree *BTree) findChildInInternalNode(node *BTreePage, searchKey []byte) Pa
 
 func (tree *BTree) insertIntoLeaf(node *BTreePage, newKey, newVal []byte) error {
 	reqBytes := uint32(4 + len(newKey) + len(newVal))
+
+	// Purge every existing cell with this key first. A prior migration/clone bug
+	// could leave duplicate leaf cells; replacing only the first left the rest
+	// and made List/Iterator report the same ETL workflow dozens of times.
+	for {
+		numCells := node.NumCells()
+		offset := uint32(BTreeHeaderSize)
+		found := false
+		for i := uint16(0); i < numCells; i++ {
+			if offset+4 > PageSize {
+				break
+			}
+			kLen := uint32(binary.LittleEndian.Uint16(node.Data[offset : offset+2]))
+			vLen := uint32(binary.LittleEndian.Uint16(node.Data[offset+2 : offset+4]))
+			cellBytes := 4 + kLen + vLen
+			if offset+cellBytes > PageSize {
+				break
+			}
+			cellKey := node.Data[offset+4 : offset+4+kLen]
+			if bytes.Equal(newKey, cellKey) {
+				if err := tree.deleteLeafCell(node, offset, cellBytes); err != nil {
+					return err
+				}
+				found = true
+				break // restart scan after compacting slide
+			}
+			offset += cellBytes
+		}
+		if !found {
+			break
+		}
+	}
+
 	if !node.IsSafeForInsert(reqBytes) {
 		return ErrPageFull
 	}
+
 	numCells := node.NumCells()
-	var offset uint32 = BTreeHeaderSize
 	insertOffset := uint32(0)
 	found := false
-	
+	offset := uint32(BTreeHeaderSize)
 	for i := uint16(0); i < numCells; i++ {
 		if offset+4 > PageSize {
 			break
 		}
 		kLen := uint32(binary.LittleEndian.Uint16(node.Data[offset : offset+2]))
 		vLen := uint32(binary.LittleEndian.Uint16(node.Data[offset+2 : offset+4]))
-		if offset+4+kLen+vLen > PageSize {
+		cellBytes := 4 + kLen + vLen
+		if offset+cellBytes > PageSize {
 			break
 		}
-		
+
 		cellKey := node.Data[offset+4 : offset+4+kLen]
 		if !found && bytes.Compare(newKey, cellKey) < 0 {
 			insertOffset = offset
 			found = true
 		}
-		offset += 4 + kLen + vLen
+		offset += cellBytes
 	}
 	if !found {
 		insertOffset = offset
 	}
-	if insertOffset < offset && offset+reqBytes <= PageSize {
+	if insertOffset+reqBytes > PageSize {
+		return ErrPageFull
+	}
+	if insertOffset < offset {
 		copy(node.Data[insertOffset+reqBytes:offset+reqBytes], node.Data[insertOffset:offset])
 	}
-	if insertOffset+reqBytes <= PageSize {
-		binary.LittleEndian.PutUint16(node.Data[insertOffset:insertOffset+2], uint16(len(newKey)))
-		binary.LittleEndian.PutUint16(node.Data[insertOffset+2:insertOffset+4], uint16(len(newVal)))
-		keyStart := insertOffset + 4
-		valStart := keyStart + uint32(len(newKey))
-		copy(node.Data[keyStart:valStart], newKey)
-		copy(node.Data[valStart:valStart+uint32(len(newVal))], newVal)
-		node.SetNumCells(numCells + 1)
-		node.MemVersion++
+	binary.LittleEndian.PutUint16(node.Data[insertOffset:insertOffset+2], uint16(len(newKey)))
+	binary.LittleEndian.PutUint16(node.Data[insertOffset+2:insertOffset+4], uint16(len(newVal)))
+	keyStart := insertOffset + 4
+	valStart := keyStart + uint32(len(newKey))
+	copy(node.Data[keyStart:valStart], newKey)
+	copy(node.Data[valStart:valStart+uint32(len(newVal))], newVal)
+	node.SetNumCells(numCells + 1)
+	node.MemVersion++
+	return nil
+}
+
+func (tree *BTree) deleteLeafCell(node *BTreePage, offset, cellBytes uint32) error {
+	var tailOffset uint32 = BTreeHeaderSize
+	numCells := node.NumCells()
+	for i := uint16(0); i < numCells; i++ {
+		if tailOffset+4 > PageSize {
+			break
+		}
+		kLen := uint32(binary.LittleEndian.Uint16(node.Data[tailOffset : tailOffset+2]))
+		vLen := uint32(binary.LittleEndian.Uint16(node.Data[tailOffset+2 : tailOffset+4]))
+		tailOffset += 4 + kLen + vLen
 	}
+	if offset+cellBytes > tailOffset || tailOffset > PageSize {
+		return ErrPageFull
+	}
+	copy(node.Data[offset:tailOffset-cellBytes], node.Data[offset+cellBytes:tailOffset])
+	for idx := tailOffset - cellBytes; idx < tailOffset; idx++ {
+		node.Data[idx] = 0
+	}
+	node.SetNumCells(numCells - 1)
+	node.MemVersion++
 	return nil
 }
 

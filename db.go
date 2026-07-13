@@ -16,6 +16,7 @@ type DB struct {
 	nextTxnID  atomic.Uint64
 	activeTxns sync.Map
 	quit       chan struct{}
+	closeOnce  sync.Once
 	wg         sync.WaitGroup
 	metrics    EngineMetrics
 }
@@ -73,6 +74,45 @@ func (db *DB) countActiveTransactions() int64 {
 		return true
 	})
 	return count
+}
+
+// SlottedPageSlotCount returns the active slot count for a slotted page.
+func (db *DB) SlottedPageSlotCount(pageID PageID) (uint32, error) {
+	page, err := db.bp.FetchPage(pageID)
+	if err != nil {
+		return 0, err
+	}
+	page.Latch.RLock()
+	count := page.GetSlotCount()
+	page.Latch.RUnlock()
+	db.bp.UnpinPage(pageID, false)
+	return count, nil
+}
+
+// ResetSlottedPage clears a legacy slotted page after its records are migrated elsewhere.
+func (db *DB) ResetSlottedPage(pageID PageID) error {
+	page, err := db.bp.FetchPage(pageID)
+	if err != nil {
+		return err
+	}
+	page.Latch.Lock()
+	page.Init()
+	page.Latch.Unlock()
+	db.bp.UnpinPage(pageID, true)
+	return db.bp.FlushAll()
+}
+
+// CompactSlottedPage rebuilds a slotted page, keeping only the latest non-expired record per key.
+func (db *DB) CompactSlottedPage(pageID PageID) error {
+	page, err := db.bp.FetchPage(pageID)
+	if err != nil {
+		return err
+	}
+	page.Latch.Lock()
+	db.compactPage(page)
+	page.Latch.Unlock()
+	db.bp.UnpinPage(pageID, true)
+	return nil
 }
 
 // compactPage strips out expired versions or deleted slots to defragment slot tables.
@@ -230,6 +270,16 @@ func (db *DB) Write(pageID PageID, txnID uint64, key []byte, value []byte, mixPa
 }
 
 // Read extracts payloads by searching active slot locations under MVCC rules
+// isRecordVisible reports whether a slotted record is visible to readTxnID.
+// Committed records (no active txn) remain readable after process restarts even
+// when their txn id is higher than the freshly issued read snapshot id.
+func isRecordVisible(recordTxnID, readTxnID uint64, isActive bool) bool {
+	if isActive {
+		return recordTxnID <= readTxnID
+	}
+	return true
+}
+
 func (db *DB) Read(pageID PageID, readTxnID uint64, key []byte) ([]byte, error) {
 	page, err := db.bp.FetchPage(pageID)
 	if err != nil {
@@ -243,9 +293,12 @@ func (db *DB) Read(pageID PageID, readTxnID uint64, key []byte) ([]byte, error) 
 	slotCount := page.GetSlotCount()
 	var latestValue []byte
 	var highestTxnID uint64 = 0
+	var highestSlot int = -1
 	now := time.Now().UnixNano()
 
-	// Traverse the slotted registry offsets to construct target states cleanly
+	// Traverse the slotted registry offsets to construct target states cleanly.
+	// Prefer highest slot index among visible records so post-restart writes
+	// (low txn ids after empty-WAL recovery) still supersede older high-txn records.
 	for i := uint32(0); i < slotCount; i++ {
 		slot, err := page.GetSlot(i)
 		if err != nil || slot.Length == 0 {
@@ -264,13 +317,18 @@ func (db *DB) Read(pageID PageID, readTxnID uint64, key []byte) ([]byte, error) 
 		_, isActive := db.activeTxns.Load(recordTxnID)
 		isCommitted := !isActive || recordTxnID == readTxnID
 
-		if bytes.Equal(recordKey, key) && recordTxnID <= readTxnID && recordTxnID >= highestTxnID && isCommitted {
+		if bytes.Equal(recordKey, key) && isRecordVisible(recordTxnID, readTxnID, isActive) && isCommitted {
+			// Later slot wins; tie-break with higher txn id
+			better := int(i) > highestSlot || (int(i) == highestSlot && recordTxnID >= highestTxnID)
+			if !better {
+				continue
+			}
+			highestSlot = int(i)
+			highestTxnID = recordTxnID
 			if expiresAt > now {
-				highestTxnID = recordTxnID
 				latestValue = make([]byte, valLen)
 				copy(latestValue, recordVal)
 			} else {
-				highestTxnID = recordTxnID
 				latestValue = nil // Registered structural deletion or timeline visibility expiration
 			}
 		}
@@ -291,7 +349,11 @@ func (db *DB) Scan(pageID PageID, readTxnID uint64, prefix []byte, iter func(key
 	defer page.Latch.RUnlock()
 
 	slotCount := page.GetSlotCount()
-	type scanRecord struct { txnID uint64; val []byte }
+	type scanRecord struct {
+		txnID uint64
+		slot  int
+		val   []byte
+	}
 	latest := make(map[string]scanRecord)
 	now := time.Now().UnixNano()
 
@@ -309,13 +371,14 @@ func (db *DB) Scan(pageID PageID, readTxnID uint64, prefix []byte, iter func(key
 		recordVal := recordSlice[24+keyLen : 24+keyLen+valLen]
 		
 		_, isActive := db.activeTxns.Load(recordTxnID)
-		if (!isActive || recordTxnID == readTxnID) && bytes.HasPrefix(recordKey, prefix) && recordTxnID <= readTxnID {
+		if (!isActive || recordTxnID == readTxnID) && bytes.HasPrefix(recordKey, prefix) && isRecordVisible(recordTxnID, readTxnID, isActive) {
 			existing, exists := latest[string(recordKey)]
-			if !exists || recordTxnID >= existing.txnID {
+			better := !exists || int(i) > existing.slot || (int(i) == existing.slot && recordTxnID >= existing.txnID)
+			if better {
 				if expiresAt > now {
 					valCopy := make([]byte, valLen)
 					copy(valCopy, recordVal)
-					latest[string(recordKey)] = scanRecord{recordTxnID, valCopy}
+					latest[string(recordKey)] = scanRecord{recordTxnID, int(i), valCopy}
 				} else {
 					delete(latest, string(recordKey))
 				}
@@ -408,8 +471,22 @@ func (db *DB) HSet(pageID PageID, txnID uint64, hashKey, field, value []byte, tt
 }
 
 func (db *DB) Close() error {
-	close(db.quit)
-	db.wg.Wait()
-	if err := db.bp.FlushAll(); err != nil { return err }
-	return db.wal.Close()
+	var closeErr error
+	db.closeOnce.Do(func() {
+		close(db.quit)
+		db.wg.Wait()
+		if err := db.bp.FlushAll(); err != nil {
+			closeErr = err
+			return
+		}
+		if err := db.wal.Close(); err != nil {
+			closeErr = err
+			return
+		}
+		// Release the OS file handle so deploy/restart and tests can unlink the path.
+		if db.bp != nil && db.bp.disk != nil && db.bp.disk.device != nil {
+			closeErr = db.bp.disk.device.Close()
+		}
+	})
+	return closeErr
 }

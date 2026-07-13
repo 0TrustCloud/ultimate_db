@@ -217,6 +217,9 @@ func (bp *BufferPool) FetchPage(id PageID) (*Page, error) {
 	page.ID = id
 	page.PinCount.Store(1)
 	page.IsDirty = false
+	for i := range page.Data {
+		page.Data[i] = 0
+	}
 
 	if err := bp.disk.ReadPage(id, &page.Data); err != nil && !errors.Is(err, io.EOF) {
 		bp.freeList = append(bp.freeList, frameIdx)
@@ -233,8 +236,8 @@ func (bp *BufferPool) FetchPage(id PageID) (*Page, error) {
 		}
 	}
 
-	// Validate CRC32 check only if the page has data and is not completely blank
-	if !isAllZero {
+	// B-tree KV pages (1000+) store type/cells in the header — skip slotted CRC validation.
+	if !isAllZero && !isBTreeKVPage(id) {
 		storedCRC := page.GetChecksum()
 		computedCRC := page.ComputeChecksum()
 		if storedCRC != computedCRC && storedCRC != 0 { // Guard against intermediate un-flushed writes
@@ -302,8 +305,9 @@ func (bp *BufferPool) getAvailableFrame() (int, error) {
 		}
 
 		if victimPage.IsDirty {
-			// Compute fresh validation verification checks before writing out
-			victimPage.SetChecksum(victimPage.ComputeChecksum())
+			if !isBTreeKVPage(victimPage.ID) {
+				victimPage.SetChecksum(victimPage.ComputeChecksum())
+			}
 			if err := bp.disk.WritePage(victimPage.ID, &victimPage.Data); err != nil {
 				bp.evictor.RecordAccess(victimID)
 				return -1, err
@@ -340,6 +344,10 @@ func (bp *BufferPool) NewPage() (*Page, error) {
 	return p, err
 }
 
+func isBTreeKVPage(id PageID) bool {
+	return id >= BTreeRootPageID-2 // pages 1000+ use B-tree headers, not slotted CRC
+}
+
 func (bp *BufferPool) FlushAll() error {
 	bp.mu.Lock()
 	var dirtyPages []*Page
@@ -356,9 +364,9 @@ func (bp *BufferPool) FlushAll() error {
 	var firstErr error
 	for _, page := range dirtyPages {
 		page.Latch.Lock()
-		
-		// Seal the page integrity signature right before file descriptor transport
-		page.SetChecksum(page.ComputeChecksum())
+		if !isBTreeKVPage(page.ID) {
+			page.SetChecksum(page.ComputeChecksum())
+		}
 		err := bp.disk.WritePage(page.ID, &page.Data)
 		
 		page.Latch.Unlock()

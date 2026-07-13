@@ -54,6 +54,7 @@ type KVStore interface {
 	Put(txn TxnHandle, key []byte, value []byte, ttl time.Duration) error
 	Delete(txn TxnHandle, key []byte) error
 	NewIterator(txn TxnHandle, prefix []byte) KVIterator
+	Flush() error
 }
 
 // KVIterator provides cursor-based access across ordered structural keys.

@@ -14,6 +14,7 @@ import (
 // OSFileDevice implements BlockDevice using actual operating system files.
 type OSFileDevice struct {
 	file *os.File
+	path string
 }
 
 // NewOSFileDevice initializes a file-backed physical block device.
@@ -22,7 +23,15 @@ func NewOSFileDevice(path string) (*OSFileDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &OSFileDevice{file: file}, nil
+	return &OSFileDevice{file: file, path: path}, nil
+}
+
+// Path returns the absolute or relative filesystem path used for this device.
+func (d *OSFileDevice) Path() string {
+	if d == nil {
+		return ""
+	}
+	return d.path
 }
 
 func (d *OSFileDevice) ReadAt(p []byte, off int64) (int, error) {
